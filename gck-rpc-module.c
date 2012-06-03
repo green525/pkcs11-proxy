@@ -188,6 +188,9 @@ done:
  * CALL SESSION
  */
 
+int call_socket = -1;
+int receiver_running = 1;
+
 enum CallStatus {
 	CALL_INVALID,
 	CALL_READY,
@@ -197,22 +200,22 @@ enum CallStatus {
 };
 
 typedef struct _CallState {
-	int socket;		/* The connection we're sending on */
-	GckRpcMessage *req;	/* The current request */
-	GckRpcMessage *resp;	/* The current response */
+	int call_id;				/* ID of the request */
+	GckRpcMessage *req;			/* The current request */
+	GckRpcMessage *resp;		/* The current response */
 	int call_status;
-	struct _CallState *next;	/* For pooling of completed sockets */
+	pthread_mutex_t wait_mutex;	/* Mutex for return message */
+	pthread_cond_t wait_cond;	/* Condition for return message */
+	struct _CallState *next;	/* For list of incomplete messages */
 } CallState;
 
-/* Maximum number of idle calls */
-#define MAX_CALL_STATE_POOL 8
-
-/* All call unused call states are in this list */
 static CallState *call_state_pool = NULL;
-static unsigned int n_call_state_pool = 0;
 
 /* Mutex to protect above call state list */
 static pthread_mutex_t call_state_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Mutex to protect outbound connection from multiple senders */
+static pthread_mutex_t call_send_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Allocator for call session buffers */
 static void *call_allocator(void *p, size_t sz)
@@ -223,40 +226,26 @@ static void *call_allocator(void *p, size_t sz)
 	return res;
 }
 
-static void call_disconnect(CallState * cs)
-{
-	assert(cs);
-
-	if (cs->socket != -1) {
-		debug(("disconnected socket"));
-		close(cs->socket);
-		cs->socket = -1;
-	}
-}
-
 /* Write all data to session socket.  */
-static CK_RV call_write(CallState * cs, unsigned char *data, size_t len)
+static CK_RV call_write(unsigned char *data, size_t len)
 {
-	int fd, r;
+	int r;
 
-	assert(cs);
 	assert(data);
 	assert(len > 0);
 
 	while (len > 0) {
 
-		fd = cs->socket;
-		if (fd == -1) {
+		if (call_socket == -1) {
 			warning(("couldn't send data: socket has been closed"));
 			return CKR_DEVICE_ERROR;
 		}
 
-                r = send(fd, (void *)data, len, 0);
+        r = send(call_socket, (void *)data, len, 0);
 
 		if (r == -1) {
 			if (errno == EPIPE) {
 				warning(("couldn't send data: daemon closed connection"));
-				call_disconnect(cs);
 				return CKR_DEVICE_ERROR;
 			} else if (errno != EAGAIN && errno != EINTR) {
 				warning(("couldn't send data: %s",
@@ -274,27 +263,24 @@ static CK_RV call_write(CallState * cs, unsigned char *data, size_t len)
 }
 
 /* Read a certain amount of data from session socket. */
-static CK_RV call_read(CallState * cs, unsigned char *data, size_t len)
+static CK_RV call_read(unsigned char *data, size_t len)
 {
-	int fd, r;
+	int r;
 
-	assert(cs);
 	assert(data);
 	assert(len > 0);
 
 	while (len > 0) {
 
-		fd = cs->socket;
-		if (fd == -1) {
+		if (call_socket == -1) {
 			warning(("couldn't receive data: session socket has been closed"));
 			return CKR_DEVICE_ERROR;
 		}
 
-                r = recv(fd, (void *)data, len, 0);
+        r = recv(call_socket, (void *)data, len, 0);
 
 		if (r == 0) {
 			warning(("couldn't receive data: daemon closed connection"));
-			call_disconnect(cs);
 			return CKR_DEVICE_ERROR;
 		} else if (r == -1) {
 			if (errno != EAGAIN && errno != EINTR) {
@@ -312,14 +298,12 @@ static CK_RV call_read(CallState * cs, unsigned char *data, size_t len)
 	return CKR_OK;
 }
 
-static CK_RV call_connect(CallState * cs)
+static CK_RV call_connect()
 {
 	struct sockaddr_un addr;
 	int sock;
 
-	assert(cs);
-	assert(cs->socket == -1);
-	assert(cs->call_status == CALL_INVALID);
+	assert(call_socket == -1);
 	assert(pkcs11_socket_path[0]);
 
 	debug(("connecting to: %s", pkcs11_socket_path));
@@ -394,11 +378,10 @@ static CK_RV call_connect(CallState * cs)
 		return CKR_DEVICE_ERROR;
 	}
 
-	cs->socket = sock;
-	cs->call_status = CALL_READY;
+	call_socket = sock;
 	debug(("connected socket"));
 
-	return call_write(cs, (unsigned char*)&pkcs11_app_id,
+	return call_write((unsigned char*)&pkcs11_app_id,
 			  sizeof(pkcs11_app_id));
 }
 
@@ -407,11 +390,9 @@ static void call_destroy(void *value)
 	CallState *cs = value;
 
 	if (value) {
-		call_disconnect(cs);
-		assert(cs->socket == -1);
-
 		gck_rpc_message_free(cs->req);
 		gck_rpc_message_free(cs->resp);
+		/* TODO: mutex? */
 
 		free(cs);
 
@@ -419,44 +400,26 @@ static void call_destroy(void *value)
 	}
 }
 
-static CK_RV call_lookup(CallState ** ret)
+static CK_RV call_create(CallState ** ret)
 {
 	CallState *cs = NULL;
 	CK_RV rv;
 
 	assert(ret);
 
+	cs = calloc(1, sizeof(CallState));
+	if (cs == NULL)
+		return CKR_HOST_MEMORY;
+	cs->call_status = CALL_READY;
+
+	/* add to pool of ongoing messages */
 	pthread_mutex_lock(&call_state_mutex);
 
-	/* Pop one from the pool if possible */
-	if (call_state_pool != NULL) {
-		cs = call_state_pool;
-		call_state_pool = cs->next;
-		cs->next = NULL;
-		assert(n_call_state_pool > 0);
-		--n_call_state_pool;
-	}
+	cs->next = call_state_pool;
+	call_state_pool = cs;
 
 	pthread_mutex_unlock(&call_state_mutex);
 
-	if (cs == NULL) {
-		cs = calloc(1, sizeof(CallState));
-		if (cs == NULL)
-			return CKR_HOST_MEMORY;
-		cs->socket = -1;
-		cs->call_status = CALL_INVALID;
-
-		/* Try to connect the call */
-		rv = call_connect(cs);
-		if (rv != CKR_OK) {
-			free(cs);
-			return rv;
-		}
-	}
-
-	assert(cs->call_status == CALL_READY);
-	assert(cs->socket != -1);
-	assert(cs->next == NULL);
 	*ret = cs;
 	return CKR_OK;
 }
@@ -495,7 +458,7 @@ static CK_RV call_prepare(CallState * cs, int call_id)
 static CK_RV call_send_recv(CallState * cs)
 {
 	GckRpcMessage *req, *resp;
-	unsigned char buf[4];
+	unsigned char buf[4+4];
 	uint32_t len;
 	CK_RV ret;
 
@@ -527,31 +490,21 @@ static CK_RV call_send_recv(CallState * cs)
 
 	/* Send the number of bytes, and then the data */
 
+	egg_buffer_encode_uint32(buf, cs->call_id);
 	egg_buffer_encode_uint32(buf, req->buffer.len);
-	ret = call_write(cs, buf, 4);
-	if (ret != CKR_OK)
-		goto cleanup;
-	ret = call_write(cs, req->buffer.buf, req->buffer.len);
-	if (ret != CKR_OK)
-		goto cleanup;
-
-	/* Now read out the number of bytes, and then the data */
-	ret = call_read(cs, buf, 4);
-	if (ret != CKR_OK)
-		goto cleanup;
-
-	len = egg_buffer_decode_uint32(buf);
-	if (!egg_buffer_reserve(&resp->buffer, len + resp->buffer.len)) {
-		warning(("couldn't allocate %u byte response area: out of memory", len));
-		ret = CKR_HOST_MEMORY;
+	pthread_mutex_lock(&call_send_mutex);
+	ret = call_write(buf, 4+4);
+	if (ret != CKR_OK) {
+		pthread_mutex_unlock(&call_send_mutex);
 		goto cleanup;
 	}
-
-	ret = call_read(cs, resp->buffer.buf, len);
+	ret = call_write(req->buffer.buf, req->buffer.len);
+	pthread_mutex_unlock(&call_send_mutex);
 	if (ret != CKR_OK)
 		goto cleanup;
 
-	egg_buffer_add_empty(&resp->buffer, len);
+	/* TODO: wait for answer */
+
 	if (!gck_rpc_message_parse(resp, GCK_RPC_RESPONSE))
 		goto cleanup;
 
@@ -568,6 +521,51 @@ cleanup:
 	return ret;
 }
 
+void receiver_thread(void *t)
+{
+	uint32_t len;
+	CK_RV ret;
+	unsigned char buf[4+4];
+	GckRpcMessage *req, *resp;
+
+	debug("Receiver thread started.");
+
+	while (receiver_running) {
+
+		/* open connection */
+		while (receiver_running && call_socket == -1 && ret != CKR_OK) {
+			pthread_mutex_lock(&call_send_mutex);
+			ret = call_connect();
+			pthread_mutex_unlock(&call_send_mutex);
+			if (ret != CKR_OK)
+				sleep(1);
+		}
+
+		/* Now read out the number of bytes, and then the data */
+		ret = call_read(buf, 4);
+		if (ret != CKR_OK) {
+			/* TODO: signal invalid result */
+			continue;
+		}
+
+		len = egg_buffer_decode_uint32(buf);
+		if (!egg_buffer_reserve(&resp->buffer, len + resp->buffer.len)) {
+			warning(("couldn't allocate %u byte response area: out of memory", len));
+			ret = CKR_HOST_MEMORY;
+			/* TODO: signal invalid result */
+			continue;
+		}
+
+		ret = call_read(resp->buffer.buf, len);
+		if (ret != CKR_OK) {
+			/* TODO: signal invalid result */
+			continue;
+		}
+
+		egg_buffer_add_empty(&resp->buffer, len);
+	}
+}
+
 /*
  * At this point the request is ready. So we validate it, and we send it to
  * the daemon for a response.
@@ -580,7 +578,6 @@ static CK_RV call_run(CallState * cs)
 	assert(cs);
 	assert(cs->req);
 	assert(cs->call_status == CALL_PREP);
-	assert(cs->socket != -1);
 
 	/* Did building the call fail? */
 	if (gck_rpc_message_buffer_error(cs->req)) {
@@ -630,6 +627,7 @@ static CK_RV call_run(CallState * cs)
 
 static CK_RV call_done(CallState * cs, CK_RV ret)
 {
+	CallState * csp;
 	assert(cs);
 	assert(cs->call_status > CALL_INVALID);
 
@@ -650,25 +648,24 @@ static CK_RV call_done(CallState * cs, CK_RV ret)
 
 	/* Certain error codes cause us to discard the conenction */
 	if (ret != CKR_DEVICE_ERROR && ret != CKR_DEVICE_REMOVED
-	    && cs->socket != -1) {
+	    && call_socket != -1) {
 
-		/* Try and stash it away for later use */
+
+		/* remove from pool of ongoing messages */
 		pthread_mutex_lock(&call_state_mutex);
 
-		if (n_call_state_pool < MAX_CALL_STATE_POOL) {
-			cs->call_status = CALL_READY;
-			assert(cs->next == NULL);
-			cs->next = call_state_pool;
-			call_state_pool = cs;
-			++n_call_state_pool;
-			cs = NULL;
+		if (call_state_pool == cs)
+			call_state_pool = cs->next;
+		else {
+			for (csp = call_state_pool; csp != NULL && csp->next != cs; csp = csp->next);
+			if (csp->next == cs)
+				csp->next = cs->next;
 		}
 
 		pthread_mutex_unlock(&call_state_mutex);
 	}
 
-	if (cs != NULL)
-		call_destroy(cs);
+	call_destroy(cs);
 
 	return ret;
 }
@@ -1035,7 +1032,7 @@ proto_read_sesssion_info(GckRpcMessage * msg, CK_SESSION_INFO_PTR info)
 	{  \
 		CallState *_cs; \
 		CK_RV _ret = CKR_OK; \
-		_ret = call_lookup (&_cs); \
+		_ret = call_create (&_cs); \
 		if (_ret != CKR_OK) return _ret; \
 		_ret = call_prepare (_cs, GCK_RPC_CALL_##call_id); \
 		if (_ret != CKR_OK) goto _cleanup;
@@ -1268,7 +1265,9 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 	pkcs11_app_id = (uint64_t) rand() << 32 | rand();
 
 	/* Call through and initialize the daemon */
-	ret = call_lookup(&cs);
+
+	/* TODO: start receiver_thread() */
+	ret = call_create(&cs);
 	if (ret == CKR_OK) {
 		ret = call_prepare(cs, GCK_RPC_CALL_C_Initialize);
 		if (ret == CKR_OK)
@@ -1309,7 +1308,7 @@ static CK_RV rpc_C_Finalize(CK_VOID_PTR reserved)
 
 	pthread_mutex_lock(&init_mutex);
 
-	ret = call_lookup(&cs);
+	ret = call_create(&cs);
 	if (ret == CKR_OK) {
 		ret = call_prepare(cs, GCK_RPC_CALL_C_Finalize);
 		if (ret == CKR_OK) {
