@@ -824,70 +824,9 @@ static CK_RV rpc_C_Initialize(CallState * cs)
 
 static CK_RV rpc_C_Finalize(CallState * cs)
 {
-	CK_SLOT_ID_PTR slots;
-	CK_ULONG n_slots, i;
-	CK_SLOT_ID appartment;
-	CK_RV ret;
-	DispatchState *ds, *next;
-
-
-	debug(("C_Finalize: enter"));
-
-	assert(cs);
-	assert(pkcs11_module);
-
-	/*
-	 * We don't actually C_Finalize lower layers, since this would finalize
-	 * for all appartments, client applications. Anyway this is done by
-	 * the code that loaded us.
-	 *
-	 * But we do need to cleanup resources used by this client, so instead
-	 * we call C_CloseAllSessions for each appartment for this client.
-	 */
-
-	ret = (pkcs11_module->C_GetSlotList) (TRUE, NULL, &n_slots);
-	if (ret == CKR_OK) {
-		slots = calloc(n_slots, sizeof(CK_SLOT_ID));
-		if (slots == NULL) {
-			ret = CKR_DEVICE_MEMORY;
-		} else {
-			ret =
-			    (pkcs11_module->C_GetSlotList) (TRUE, slots,
-							    &n_slots);
-			for (i = 0; ret == CKR_OK && i < n_slots; ++i) {
-				appartment = slots[i];
-				ret =
-				    (pkcs11_module->
-				     C_CloseAllSessions) (appartment);
-			}
-			free(slots);
-		}
-	}
-
-	/* Make all C_WaitForSlotEvent calls return */
-	pthread_mutex_lock(&pkcs11_dispatchers_mutex);
-	for (ds = pkcs11_dispatchers; ds; ds = next) {
-		CallState *c = &ds->cs;
-
-                next = ds->next;
-
-		if (c->appid != cs->appid)
-			continue ;
-		if (c->sock == cs->sock)
-			continue ;
-		if (c->req &&
-		    c->req->call_id == GCK_RPC_CALL_C_WaitForSlotEvent) {
-			gck_rpc_log("Sending interuption signal to %d\n",
-                                    ds->socket);
-			if (ds->socket)
-				shutdown(ds->socket, SHUT_RDWR);
-			//pthread_kill(ds->thread, SIGINT);
-		}
-	}
-	pthread_mutex_unlock(&pkcs11_dispatchers_mutex);
-
-	debug(("ret: %d", ret));
-	return ret;
+	BEGIN_CALL(C_Finalize);
+	PROCESS_CALL((NULL));
+	END_CALL;
 }
 
 static CK_RV rpc_C_GetInfo(CallState * cs)
@@ -2091,8 +2030,9 @@ static int write_all(int sock, unsigned char *data, size_t len)
 
 static void run_dispatch_loop(CallState *cs)
 {
-	unsigned char buf[4];
+	unsigned char buf[8];
 	uint32_t len;
+	uint32_t msg_id;
 
 	assert(cs->sock != -1);
 
@@ -2110,17 +2050,22 @@ static void run_dispatch_loop(CallState *cs)
 		return;
 	}
 
+	/* TODO: Call C_Initialize */
+
 	/* The main thread loop */
 	while (TRUE) {
 
 		call_reset(cs);
 
-		/* Read the number of bytes ... */
-		if (!read_all(cs->sock, buf, 4))
+		/* Read the message ID and number of bytes ... */
+		if (!read_all(cs->sock, buf, 8))
 			break;
 
+		/* Random message ID */
+		msg_id = egg_buffer_decode_uint32(buf);
+
 		/* Calculate the number of bytes */
-		len = egg_buffer_decode_uint32(buf);
+		len = egg_buffer_decode_uint32(buf+4);
 		if (len >= 0x0FFFFFFF) {
 			gck_rpc_warn
 			    ("invalid message size from module: %u bytes", len);
@@ -2148,28 +2093,16 @@ static void run_dispatch_loop(CallState *cs)
 			break;
 
 		/* .. send back response length, and then response data */
-		egg_buffer_encode_uint32(buf, cs->resp->buffer.len);
-		if (!write_all(cs->sock, buf, 4) ||
+		egg_buffer_encode_uint32(buf, msg_id);
+		egg_buffer_encode_uint32(buf+4, cs->resp->buffer.len);
+		if (!write_all(cs->sock, buf, 8) ||
 		    !write_all(cs->sock, cs->resp->buffer.buf, cs->resp->buffer.len))
 			break;
 	}
 
+	/* Call C_Finalize */
+
 	call_uninit(cs);
-}
-
-static void *run_dispatch_thread(void *arg)
-{
-	CallState *cs = arg;
-	assert(cs->sock != -1);
-
-	run_dispatch_loop(cs);
-
-	/* The thread closes the socket and marks as done */
-	assert(cs->sock != -1);
-	close(cs->sock);
-	cs->sock = -1;
-
-	return NULL;
 }
 
 /* ---------------------------------------------------------------------------
@@ -2185,24 +2118,11 @@ static char pkcs11_socket_path[MAXPATHLEN] = { 0, };
 void gck_rpc_layer_accept(void)
 {
 	struct sockaddr_un addr;
-	DispatchState *ds, **here;
 	int error;
 	socklen_t addrlen;
 	int new_fd;
 
 	assert(pkcs11_socket != -1);
-
-	/* Cleanup any completed dispatch threads */
-	pthread_mutex_lock(&pkcs11_dispatchers_mutex);
-	for (here = &pkcs11_dispatchers, ds = *here; ds != NULL; ds = *here) {
-		if (ds->socket == -1) {
-			pthread_join(ds->thread, NULL);
-			*here = ds->next;
-			free(ds);
-		} else {
-			here = &ds->next;
-		}
-	}
 
 	addrlen = sizeof(addr);
 	new_fd = accept(pkcs11_socket, (struct sockaddr *)&addr, &addrlen);
@@ -2212,28 +2132,7 @@ void gck_rpc_layer_accept(void)
 		return;
 	}
 
-	ds = calloc(1, sizeof(DispatchState));
-	if (ds == NULL) {
-		gck_rpc_warn("out of memory");
-		close(new_fd);
-		return;
-	}
-
-	ds->socket = new_fd;
-	ds->cs.sock = new_fd;
-
-	error = pthread_create(&ds->thread, NULL,
-			       run_dispatch_thread, &(ds->cs));
-	if (error) {
-		gck_rpc_warn("couldn't start thread: %s", strerror(errno));
-		close(new_fd);
-		free(ds);
-		return;
-	}
-
-	ds->next = pkcs11_dispatchers;
-	pkcs11_dispatchers = ds;
-	pthread_mutex_unlock(&pkcs11_dispatchers_mutex);
+	/* TODO: fork and call run_dispatch_loop */
 }
 
 int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
