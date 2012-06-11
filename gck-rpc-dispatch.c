@@ -42,6 +42,8 @@
 # include <netinet/tcp.h>
 #endif
 #include <pthread.h>
+#include <signal.h>
+#include <sys/wait.h>
 
 #include <stdlib.h>
 #include <string.h>
@@ -60,23 +62,18 @@ typedef struct _CallState {
 	GckRpcMessage *req;
 	GckRpcMessage *resp;
 	void *allocated;
-	uint64_t appid;
-	int call;
+	uint32_t msg_id;
 	int sock;
+	int call;
 } CallState;
 
 typedef struct _DispatchState {
 	struct _DispatchState *next;
-	pthread_t thread;
-	CallState cs;
-	int socket;
+	pid_t pid;
 } DispatchState;
 
 /* A linked list of dispatcher threads */
 static DispatchState *pkcs11_dispatchers = NULL;
-
-/* A mutex to protect the dispatcher list */
-static pthread_mutex_t pkcs11_dispatchers_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* -----------------------------------------------------------------------------
  * LOGGING and DEBUGGING
@@ -108,19 +105,28 @@ void gck_rpc_log(const char *msg, ...)
  * CALL STRUCTURES
  */
 
-static int call_init(CallState * cs)
+static int call_init(CallState ** cs, int sock)
 {
+	CallState *new_cs = NULL;
 	assert(cs);
 
-	cs->req = gck_rpc_message_new((EggBufferAllocator) realloc);
-	cs->resp = gck_rpc_message_new((EggBufferAllocator) realloc);
-	if (!cs->req || !cs->resp) {
-		gck_rpc_message_free(cs->req);
-		gck_rpc_message_free(cs->resp);
+	/* Initialize call */
+	new_cs = calloc(1, sizeof(CallState));
+	if (new_cs == NULL)
+		return 0;
+
+	/* Initialize message buffers */
+	new_cs->req = gck_rpc_message_new((EggBufferAllocator) realloc);
+	new_cs->resp = gck_rpc_message_new((EggBufferAllocator) realloc);
+	if (!new_cs->req || !new_cs->resp) {
+		gck_rpc_message_free(new_cs->req);
+		gck_rpc_message_free(new_cs->resp);
 		return 0;
 	}
 
-	cs->allocated = NULL;
+	new_cs->sock = sock;
+	new_cs->allocated = NULL;
+	*cs = new_cs;
 	return 1;
 }
 
@@ -148,7 +154,7 @@ static void *call_alloc(CallState * cs, size_t length)
 	return (void *)(data + 1);
 }
 
-static void call_reset(CallState * cs)
+static void call_uninit(CallState * cs)
 {
 	void *allocated;
 	void **data;
@@ -163,17 +169,6 @@ static void call_reset(CallState * cs)
 		allocated = *data;
 		free(data);
 	}
-
-	cs->allocated = NULL;
-	gck_rpc_message_reset(cs->req);
-	gck_rpc_message_reset(cs->resp);
-}
-
-static void call_uninit(CallState * cs)
-{
-	assert(cs);
-
-	call_reset(cs);
 
 	gck_rpc_message_free(cs->req);
 	gck_rpc_message_free(cs->resp);
@@ -2028,41 +2023,51 @@ static int write_all(int sock, unsigned char *data, size_t len)
 	return 1;
 }
 
-static void run_dispatch_loop(CallState *cs)
+static void run_dispatch_loop(int sock)
 {
 	unsigned char buf[8];
+	CallState *cs = NULL;
 	uint32_t len;
-	uint32_t msg_id;
+	uint64_t appid;
+	CK_C_INITIALIZE_ARGS p11_init_args;
+	CK_RV rv;
 
-	assert(cs->sock != -1);
+	assert(sock != -1);
 
 	/* The client application */
-	if (!read_all(cs->sock, (unsigned char *)&cs->appid, sizeof (cs->appid))) {
+	if (!read_all(sock, (unsigned char *)&appid, sizeof (appid))) {
 		gck_rpc_warn("Can't read appid\n");
-		return ;
+		exit(1);
 	}
-	gck_rpc_log("New session %d-%d\n", (uint32_t) (cs->appid >> 32),
-		    (uint32_t) cs->appid);
+	gck_rpc_log("New session %d-%d\n", (uint32_t) (appid >> 32),
+		    (uint32_t) appid);
 
-	/* Setup our buffers */
-	if (!call_init(cs)) {
-		gck_rpc_warn("out of memory");
-		return;
+	/* TODO: register SIGTERM handler */
+
+	/* RPC layer expects initialized module */
+	memset(&p11_init_args, 0, sizeof(p11_init_args));
+	p11_init_args.flags = CKF_OS_LOCKING_OK;
+	rv = (pkcs11_module->C_Initialize) (&p11_init_args);
+	if (rv != CKR_OK) {
+		gck_rpc_warn("could not initialize PKCS#11 module: 0x08x", (int)rv);
+		exit(1);
 	}
-
-	/* TODO: Call C_Initialize */
+	/* TODO: initialize worker threads */
 
 	/* The main thread loop */
 	while (TRUE) {
-
-		call_reset(cs);
+		/* Setup a new call */
+		if (!call_init(&cs, sock)) {
+			gck_rpc_warn("out of memory");
+			break;
+		}
 
 		/* Read the message ID and number of bytes ... */
-		if (!read_all(cs->sock, buf, 8))
+		if (!read_all(sock, buf, 8))
 			break;
 
 		/* Random message ID */
-		msg_id = egg_buffer_decode_uint32(buf);
+		cs->msg_id = egg_buffer_decode_uint32(buf);
 
 		/* Calculate the number of bytes */
 		len = egg_buffer_decode_uint32(buf+4);
@@ -2080,7 +2085,7 @@ static void run_dispatch_loop(CallState *cs)
 		}
 
 		/* ... and read/parse in the actual message */
-		if (!read_all(cs->sock, cs->req->buffer.buf, len))
+		if (!read_all(sock, cs->req->buffer.buf, len))
 			break;
 
 		egg_buffer_add_empty(&cs->req->buffer, len);
@@ -2093,20 +2098,23 @@ static void run_dispatch_loop(CallState *cs)
 			break;
 
 		/* .. send back response length, and then response data */
-		egg_buffer_encode_uint32(buf, msg_id);
+		egg_buffer_encode_uint32(buf, cs->msg_id);
 		egg_buffer_encode_uint32(buf+4, cs->resp->buffer.len);
-		if (!write_all(cs->sock, buf, 8) ||
-		    !write_all(cs->sock, cs->resp->buffer.buf, cs->resp->buffer.len))
+		if (!write_all(sock, buf, 8) ||
+		    !write_all(sock, cs->resp->buffer.buf, cs->resp->buffer.len))
 			break;
 	}
 
-	/* Call C_Finalize */
+	/* De-initialize the PKCS#11 module */
+	(pkcs11_module->C_Finalize) (NULL);
 
 	call_uninit(cs);
+
+	exit(0);
 }
 
 /* ---------------------------------------------------------------------------
- * MAIN THREAD
+ * MAIN PROCESS
  */
 
 /* The main daemon socket that we're listening on */
@@ -2118,7 +2126,7 @@ static char pkcs11_socket_path[MAXPATHLEN] = { 0, };
 void gck_rpc_layer_accept(void)
 {
 	struct sockaddr_un addr;
-	int error;
+	pid_t new_pid;
 	socklen_t addrlen;
 	int new_fd;
 
@@ -2132,7 +2140,19 @@ void gck_rpc_layer_accept(void)
 		return;
 	}
 
-	/* TODO: fork and call run_dispatch_loop */
+	/* fork new child to handle connection */
+	new_pid = fork();
+	if (new_pid < 0) {
+		gck_rpc_warn("cannot fork new process: %d", new_pid);
+		close(new_fd);
+	} else if (new_pid > 0) {
+		debug(("forked new child process: %d", new_pid));
+		close(new_fd);
+	} else {
+		debug(("ready to handle connection"));
+		close(pkcs11_socket);
+		run_dispatch_loop(new_fd);
+	}
 }
 
 int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
@@ -2279,6 +2299,7 @@ int gck_rpc_layer_initialize(const char *prefix, CK_FUNCTION_LIST_PTR module)
 void gck_rpc_layer_uninitialize(void)
 {
 	DispatchState *ds, *next;
+	int status;
 
 	if (!pkcs11_module)
 		return;
@@ -2293,21 +2314,15 @@ void gck_rpc_layer_uninitialize(void)
 		unlink(pkcs11_socket_path);
 	pkcs11_socket_path[0] = 0;
 
-	/* Stop all of the dispatch threads */
-	pthread_mutex_lock(&pkcs11_dispatchers_mutex);
+	/* Stop all of the dispatch children */
 	for (ds = pkcs11_dispatchers; ds; ds = next) {
 		next = ds->next;
 
-		/* Forcibly shutdown the connection */
-		if (ds->socket)
-			shutdown(ds->socket, SHUT_RDWR);
-		pthread_join(ds->thread, NULL);
+		kill(ds->pid, SIGTERM);
+		waitpid(ds->pid, &status, 0);
 
-		/* This is always closed by dispatch thread */
-		assert(ds->socket == -1);
 		free(ds);
 	}
-	pthread_mutex_unlock(&pkcs11_dispatchers_mutex);
 
 	pkcs11_module = NULL;
 }

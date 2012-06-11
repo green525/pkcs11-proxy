@@ -70,6 +70,7 @@ int main(int argc, char *argv[])
 	const char *path;
 	fd_set read_fds;
 	int sock, ret;
+	CK_C_INITIALIZE_ARGS p11_init_args;
 	CK_RV rv;
 
 	/* The module to load is the argument */
@@ -104,13 +105,16 @@ int main(int argc, char *argv[])
 		exit(1);
 	}
 
-	/* RPC layer expects initialized module */
-	rv = (funcs->C_Initialize) (NULL /* &p11_init_args */);
+	/* Try to initialize the PKCS11 module */
+	memset(&p11_init_args, 0, sizeof(p11_init_args));
+	p11_init_args.flags = CKF_OS_LOCKING_OK;
+	rv = (funcs->C_Initialize) (&p11_init_args);
 	if (rv != CKR_OK) {
 		fprintf(stderr, "couldn't initialize module: %s: 0x%08x\n",
 			argv[1], (int)rv);
 		exit(1);
 	}
+	(funcs->C_Finalize) (NULL);
 
 	path = getenv("PKCS11_DAEMON_SOCKET");
 	if (!path)
