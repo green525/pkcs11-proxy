@@ -1302,6 +1302,9 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 	pthread_attr_setdetachstate(&tattr, PTHREAD_CREATE_JOINABLE);
 
 	if (init_args != NULL) {
+		warning(("multi-threaded environment with locking necessary"));
+		return CKR_CANT_LOCK;
+	} else {
 		int supplied_ok;
 
 		args = init_args;
@@ -1345,11 +1348,6 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 		 */
 		if (args->pReserved)
 			parse_arguments((const char *)args->pReserved);
-	} else {
-		warning(("running in a multi-threaded environment necessary"));
-
-		/* Just assume we may create threads and can use locking anyway */
-		pthread_mutex_lock(&init_mutex);
 	}
 
 	pid = getpid();
