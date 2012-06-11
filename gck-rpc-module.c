@@ -580,7 +580,7 @@ static CK_RV call_reset_connection()
 
 	for (cs = call_state_pool; cs != NULL; cs = cs->next)
 		if (pkcs11_initialized)
-			call_return(cs, CKR_DEVICE_ERROR);
+			call_return(cs, CKR_GENERAL_ERROR);
 		else
 			call_return(cs, CKR_CRYPTOKI_NOT_INITIALIZED);
 
