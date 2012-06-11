@@ -1301,7 +1301,7 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 		return CKR_HOST_MEMORY;
 	pthread_attr_setdetachstate(&tattr, PTHREAD_CREATE_JOINABLE);
 
-	if (init_args != NULL) {
+	if (init_args == NULL) {
 		warning(("multi-threaded environment with locking necessary"));
 		return CKR_CANT_LOCK;
 	} else {
