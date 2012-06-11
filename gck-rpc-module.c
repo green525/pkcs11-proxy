@@ -579,7 +579,10 @@ static CK_RV call_reset_connection()
 	pthread_mutex_unlock(&call_send_mutex);
 
 	for (cs = call_state_pool; cs != NULL; cs = cs->next)
-		call_return(cs, CKR_DEVICE_ERROR);
+		if (pkcs11_initialized)
+			call_return(cs, CKR_DEVICE_ERROR);
+		else
+			call_return(cs, CKR_CRYPTOKI_NOT_INITIALIZED);
 
 	return CKR_OK;
 }
@@ -1298,12 +1301,9 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 		return CKR_HOST_MEMORY;
 	pthread_attr_setdetachstate(&tattr, PTHREAD_CREATE_JOINABLE);
 
-	pthread_mutex_lock(&init_mutex);
-
 	if (init_args != NULL) {
 		int supplied_ok;
 
-		/* pReserved must be NULL */
 		args = init_args;
 
 		/* ALL supplied function pointers need to have the value either NULL or non-NULL. */
@@ -1316,8 +1316,7 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 			&& args->UnlockMutex != NULL);
 		if (!supplied_ok) {
 			warning(("invalid set of mutex calls supplied"));
-			ret = CKR_ARGUMENTS_BAD;
-			goto done;
+			return CKR_ARGUMENTS_BAD;
 		}
 
 		/*
@@ -1326,9 +1325,19 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 		 */
 		if (!(args->flags & CKF_OS_LOCKING_OK)) {
 			warning(("can't do without os locking"));
-			ret = CKR_CANT_LOCK;
-			goto done;
+			return CKR_CANT_LOCK;
 		}
+
+		/*
+		 * When the CKF_LIBRARY_CANT_CREATE_OS_THREADS flag is set -> error.
+		 * We need to create the receiver thread.
+		 */
+		if (args->flags & CKF_LIBRARY_CANT_CREATE_OS_THREADS) {
+			warning(("can't do without creating new threads"));
+			return CKR_NEED_TO_CREATE_THREADS;
+		}
+
+		pthread_mutex_lock(&init_mutex);
 
 		/*
 		 * We support setting the socket path and other arguments from from the
@@ -1336,6 +1345,11 @@ static CK_RV rpc_C_Initialize(CK_VOID_PTR init_args)
 		 */
 		if (args->pReserved)
 			parse_arguments((const char *)args->pReserved);
+	} else {
+		warning(("running in a multi-threaded environment necessary"));
+
+		/* Just assume we may create threads and can use locking anyway */
+		pthread_mutex_lock(&init_mutex);
 	}
 
 	pid = getpid();
