@@ -324,7 +324,7 @@ static CK_RV call_connect()
 		if (!p || !ip) {
 			gck_rpc_warn("invalid syntax for pkcs11 socket : %s",
 				     pkcs11_socket_path);
-			return CKR_DEVICE_ERROR;
+			return CKR_GENERAL_ERROR;
 		}
 		*p = '\0';
 		port = strtol(p + 1, NULL, 0);
@@ -334,7 +334,7 @@ static CK_RV call_connect()
 		if (sock < 0) {
 			gck_rpc_warn("couldn't create pkcs11 socket: %s",
 				     strerror(errno));
-			return CKR_DEVICE_ERROR;
+			return CKR_FUNCTION_FAILED;
 		}
 
 		if (setsockopt(sock, IPPROTO_TCP, TCP_NODELAY,
@@ -342,14 +342,14 @@ static CK_RV call_connect()
 			gck_rpc_warn
 			    ("couldn't create set pkcs11 socket options : %s",
 			     strerror(errno));
-			return CKR_DEVICE_ERROR;
+			return CKR_FUNCTION_FAILED;
 		}
 
 		addr.sun_family = AF_INET;
 		if (inet_aton(ip, &((struct sockaddr_in *)&addr)->sin_addr) ==
 		    0) {
 			gck_rpc_warn("bad inet address : %s", ip);
-			return CKR_DEVICE_ERROR;
+			return CKR_GENERAL_ERROR;
 		}
 		((struct sockaddr_in *)&addr)->sin_port = htons(port);
 	} else {
@@ -360,7 +360,7 @@ static CK_RV call_connect()
 		sock = socket(AF_UNIX, SOCK_STREAM, 0);
 		if (sock < 0) {
 			warning(("couldn't open socket: %s", strerror(errno)));
-			return CKR_DEVICE_ERROR;
+			return CKR_FUNCTION_FAILED;
 		}
 	}
 
@@ -369,7 +369,7 @@ static CK_RV call_connect()
 	if (fcntl(sock, F_SETFD, 1) == -1) {
 		close(sock);
 		warning(("couldn't secure socket: %s", strerror(errno)));
-		return CKR_DEVICE_ERROR;
+		return CKR_FUNCTION_FAILED;
 	}
 #endif
 
@@ -377,7 +377,7 @@ static CK_RV call_connect()
 		close(sock);
 		warning(("couldn't connect to: %s: %s", pkcs11_socket_path,
 			 strerror(errno)));
-		return CKR_DEVICE_ERROR;
+		return CKR_FUNCTION_FAILED;
 	}
 
 	call_socket = sock;
@@ -1410,7 +1410,6 @@ static CK_RV rpc_C_Finalize(CK_VOID_PTR reserved)
 {
 	CallState *cs;
 	CK_RV ret;
-	int fd;
 
 	debug(("C_Finalize: enter"));
 	return_val_if_fail(pkcs11_initialized, CKR_CRYPTOKI_NOT_INITIALIZED);
