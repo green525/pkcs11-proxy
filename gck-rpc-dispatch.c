@@ -50,6 +50,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <stdio.h>
+#include <time.h>
 
 /* Where we dispatch the calls to */
 static CK_FUNCTION_LIST_PTR pkcs11_module = NULL;
@@ -79,7 +80,7 @@ static DispatchState *pkcs11_dispatchers = NULL;
  * LOGGING and DEBUGGING
  */
 #undef DEBUG_OUTPUT
-#define DEBUG_OUTPUT 1
+#define DEBUG_OUTPUT 0
 #if DEBUG_OUTPUT
 #define debug(x) gck_rpc_debug x
 #else
@@ -94,9 +95,11 @@ static DispatchState *pkcs11_dispatchers = NULL;
 void gck_rpc_log(const char *msg, ...)
 {
 	va_list ap;
+	char buf[1024];
 
+	snprintf(buf, sizeof(buf), "%d,%x %s", getpid(), pthread_self(), msg);
 	va_start(ap, msg);
-	vfprintf(stdout, msg, ap);
+	vfprintf(stdout, buf, ap);
 	printf("\n");
 	va_end(ap);
 }
@@ -172,6 +175,8 @@ static void call_uninit(CallState * cs)
 
 	gck_rpc_message_free(cs->req);
 	gck_rpc_message_free(cs->resp);
+
+	free(cs);
 }
 
 /* -------------------------------------------------------------------
@@ -1974,7 +1979,7 @@ static int read_all(int sock, unsigned char *data, size_t len)
 
 	while (len > 0) {
 
-                r = recv(sock, (void *)data, len, 0);
+        r = recv(sock, (void *)data, len, 0);
 
 		if (r == 0) {
 			/* Connection was closed on client */
@@ -1983,7 +1988,7 @@ static int read_all(int sock, unsigned char *data, size_t len)
 			if (errno != EAGAIN && errno != EINTR) {
 				gck_rpc_warn("couldn't receive data: %s",
 					     strerror(errno));
-				return 0;
+				return r;
 			}
 		} else {
 			data += r;
@@ -2023,6 +2028,100 @@ static int write_all(int sock, unsigned char *data, size_t len)
 	return 1;
 }
 
+/* Call state, protecting mutex and conditions */
+static CallState *job_cs = NULL;
+static pthread_mutex_t job_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t write_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t job_posted = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t job_taken = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t thread_started = PTHREAD_COND_INITIALIZER;
+int max_workers_waiting = 2;
+static int workers_waiting = 0;
+static int workers_running = 0;
+#define THREAD_TIMEOUT 5;
+
+/* worker thread handling incoming messages */
+static void * worker_thread(void * t)
+{
+	unsigned char buf[8];
+	CallState *cs = NULL;
+	int ret;
+
+	/* initially get the mutex and signal availability */
+	ret = pthread_mutex_lock(&job_mutex);
+	if (ret != 0) {
+		gck_rpc_warn("Worker cannot acquire the mutex: %d", ret);
+		pthread_exit(&ret);
+	}
+	workers_running++;
+	pthread_cond_signal(&thread_started);
+
+	/* main loop */
+	while (TRUE) {
+		workers_waiting++;
+
+		/* wait for a job to become available */
+		while (job_cs == NULL)
+			pthread_cond_wait(&job_posted, &job_mutex);
+		workers_waiting--;
+
+		/* catch the job */
+		debug(("Worker received new job"));
+		cs = job_cs;
+		job_cs = NULL;
+
+		/* signal free space */
+		pthread_cond_signal(&job_taken);
+		pthread_mutex_unlock(&job_mutex);
+
+		/* ... send for processing ... */
+		dispatch_call(cs);
+
+		/* .. send back response length, and then response data */
+		egg_buffer_encode_uint32(buf, cs->msg_id);
+		egg_buffer_encode_uint32(buf+4, cs->resp->buffer.len);
+		ret = pthread_mutex_lock(&write_mutex);
+		if (ret != 0) {
+			gck_rpc_warn("Worker cannot acquire write permission: %d", ret);
+			call_uninit(cs);
+			break;
+		}
+		ret = write_all(cs->sock, buf, 8);
+		if (ret)
+			ret = write_all(cs->sock, cs->resp->buffer.buf, cs->resp->buffer.len);
+		pthread_mutex_unlock(&write_mutex);
+
+		call_uninit(cs);
+
+		/* If there was a write error, the connection was closed */
+		if (!ret) {
+			gck_rpc_warn("Worker cannot not send response");
+			break;
+		}
+
+		/* get mutex to signal availability */
+		ret = pthread_mutex_lock(&job_mutex);
+		if (ret != 0) {
+			gck_rpc_warn("Worker cannot acquire the mutex: %d", ret);
+			break;
+		}
+
+		/* Exit if there are too many waiting workers */
+		if (workers_waiting > max_workers_waiting) {
+			pthread_mutex_unlock(&job_mutex);
+			debug(("Too many idle worker threads, exiting"));
+			break;
+		}
+	}
+
+	/* de-register from running workers */
+	pthread_mutex_lock(&job_mutex);
+	workers_running--;
+	pthread_mutex_unlock(&job_mutex);
+
+	pthread_exit(&ret);
+}
+
 static void run_dispatch_loop(int sock)
 {
 	unsigned char buf[8];
@@ -2031,15 +2130,18 @@ static void run_dispatch_loop(int sock)
 	uint64_t appid;
 	CK_C_INITIALIZE_ARGS p11_init_args;
 	CK_RV rv;
+	int ret;
+	pthread_t tid;
+	struct timespec timeout;
 
 	assert(sock != -1);
 
 	/* The client application */
-	if (!read_all(sock, (unsigned char *)&appid, sizeof (appid))) {
+	if (read_all(sock, (unsigned char *)&appid, sizeof (appid)) <= 0) {
 		gck_rpc_warn("Can't read appid\n");
 		exit(1);
 	}
-	gck_rpc_log("New session %d-%d\n", (uint32_t) (appid >> 32),
+	gck_rpc_log("New session %08x-%08x\n", (uint32_t) (appid >> 32),
 		    (uint32_t) appid);
 
 	/* TODO: register SIGTERM handler */
@@ -2052,7 +2154,6 @@ static void run_dispatch_loop(int sock)
 		gck_rpc_warn("could not initialize PKCS#11 module: 0x08x", (int)rv);
 		exit(1);
 	}
-	/* TODO: initialize worker threads */
 
 	/* The main thread loop */
 	while (TRUE) {
@@ -2063,7 +2164,11 @@ static void run_dispatch_loop(int sock)
 		}
 
 		/* Read the message ID and number of bytes ... */
-		if (!read_all(sock, buf, 8))
+		ret = read_all(sock, buf, 8);
+		if (ret == 0) {
+			gck_rpc_log("dispatcher connection closed");
+			break;
+		} else if (ret < 0)
 			break;
 
 		/* Random message ID */
@@ -2076,6 +2181,7 @@ static void run_dispatch_loop(int sock)
 			    ("invalid message size from module: %u bytes", len);
 			break;
 		}
+		debug(("Received message id: %08x, len: %d", cs->msg_id, len));
 
 		/* Allocate memory */
 		egg_buffer_reserve(&cs->req->buffer, cs->req->buffer.len + len);
@@ -2085,30 +2191,61 @@ static void run_dispatch_loop(int sock)
 		}
 
 		/* ... and read/parse in the actual message */
-		if (!read_all(sock, cs->req->buffer.buf, len))
+		if (read_all(sock, cs->req->buffer.buf, len) <= 0) {
+			gck_rpc_warn("dispatcher read error");
 			break;
+		}
 
 		egg_buffer_add_empty(&cs->req->buffer, len);
 
 		if (!gck_rpc_message_parse(cs->req, GCK_RPC_REQUEST))
 			break;
 
-		/* ... send for processing ... */
-		if (!dispatch_call(cs))
+		ret = pthread_mutex_lock(&job_mutex);
+		if (ret != 0) {
+			gck_rpc_warn("Dispatcher cannot acquire mutex: %d", ret);
 			break;
+		}
 
-		/* .. send back response length, and then response data */
-		egg_buffer_encode_uint32(buf, cs->msg_id);
-		egg_buffer_encode_uint32(buf+4, cs->resp->buffer.len);
-		if (!write_all(sock, buf, 8) ||
-		    !write_all(sock, cs->resp->buffer.buf, cs->resp->buffer.len))
-			break;
+		/* If there is no worker thread available, create a new one and
+		 * wait for its availability
+		 */
+		if (workers_waiting == 0) {
+			ret = pthread_create(&tid, NULL, worker_thread, NULL);
+			if (ret != 0) {
+				gck_rpc_warn("Could not start new worker thread: %d", ret);
+				break;
+			}
+			clock_gettime(CLOCK_REALTIME, &timeout);
+			timeout.tv_sec += THREAD_TIMEOUT;
+			ret = pthread_cond_timedwait(&thread_started, &job_mutex, &timeout);
+			if (ret == 0)
+				debug(("New worker thread created: 0x%x", tid));
+			else if (workers_waiting == 0) {
+				gck_rpc_warn("No worker thread available nor startable: %d", ret);
+				pthread_mutex_unlock(&job_mutex);
+				break;
+			}
+		}
+
+		/* post the job */
+		job_cs = cs;
+
+		/* signal job available and wait for it being taken */
+		while (job_cs != NULL) {
+			pthread_cond_signal(&job_posted);
+			pthread_cond_wait(&job_taken, &job_mutex);
+		}
+
+		pthread_mutex_unlock(&job_mutex);
+		gck_rpc_log("running: %d, waiting: %d", workers_running, workers_waiting);
 	}
 
 	/* De-initialize the PKCS#11 module */
 	(pkcs11_module->C_Finalize) (NULL);
 
-	call_uninit(cs);
+	/* Close the connection */
+	close(sock);
 
 	exit(0);
 }

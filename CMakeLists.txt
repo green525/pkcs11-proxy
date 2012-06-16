@@ -34,7 +34,7 @@ if (WIN32)
 endif (WIN32)
 
 target_link_libraries (pkcs11-proxy pthread)
-target_link_libraries (pkcs11-daemon dl pthread)
+target_link_libraries (pkcs11-daemon dl pthread rt)
 
 install_targets (/lib pkcs11-proxy)
 install_targets (/bin pkcs11-daemon)
